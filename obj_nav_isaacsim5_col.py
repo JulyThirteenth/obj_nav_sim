@@ -271,6 +271,10 @@ def build_glass_cubes_only(items,
 
 
 
+
+
+
+
 # ---------- end ----------
 
 
@@ -299,6 +303,7 @@ class PegasusApp:
         # Load environment
         print("="*50)
         self.pg.load_environment(SIMULATION_ENVIRONMENTS[env_name])
+        # self.pg.load_environment(usd_path="/home/shaw/devspace/obj_nav_sim/XR_Content_NVD@10010/Assets/XR/Stages/Indoor/Modern_House_XR_modified.usd")
         # self.pg.load_environment(usd_path='/home/shaw/Downloads/XR_Content_NVD@10010/Assets/XR/Stages/Indoor/Warehouse_XR.usd')
         print(f"load environment: {env_name}")
         print("="*50)
@@ -336,8 +341,11 @@ class PegasusApp:
         print_glass_like_robust("/World/layout")
         print("="*50)
 
-        items = list_glass_like_robust("/World/layout")
-        build_glass_cubes_only(items)  # 透明度可调：0.05~0.2
+        # items = list_glass_like_robust("/World/layout")
+        # build_glass_cubes_only(items)  # 透明度可调：0.05~0.2
+        from build_glass_cube import build_glass_cubes_from_xforms
+        build_glass_cubes_from_xforms("/World/layout", "/World/_visual_glass", thickness=0.02)
+
         simulation_app.update()  # 刷一下
 
 
@@ -580,9 +588,9 @@ def main():
     import rclpy
     rclpy.init()
     pg_app = PegasusApp(
-        env_name="Hospital",
+        env_name="Office",
         obj_name="manzana_apple",
-        flight_pos=np.array([0, 0, 0.5]),
+        flight_pos=np.array([-22, 9.3, 0.5]),
         object_pos=np.array([2, 0, 0.5])
     )
     pg_app.run()

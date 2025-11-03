@@ -141,6 +141,7 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_x = math.nan
         self.ned_y = math.nan
         self.ned_z = math.nan  # VehicleLocalPosition.z（向下为正）
+        self._heading_rad = math.nan
 
         # “最近一次 setpoint”，用于定时器保活重复发布
         self._last_sp: Optional[TrajectorySetpoint] = None
@@ -155,7 +156,12 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_x = float(msg.x)
         self.ned_y = float(msg.y)
         self.ned_z = float(msg.z)  # NED：向下为正
-        print(f"Local Position NED: x={self.ned_x:.2f}, y={self.ned_y:.2f}, z={self.ned_z:.2f}")
+        heading = getattr(msg, "heading", math.nan)
+        if heading is not None:
+            heading = float(heading)
+            if math.isfinite(heading):
+                self._heading_rad = heading
+        print(f"Local Position NED: x={self.ned_x:.2f}, y={self.ned_y:.2f}, z={self.ned_z:.2f}, heading={heading}")
 
     def _on_status(self, msg: VehicleStatus):
         # arming_state: VehicleStatus.ARMING_STATE_ARMED 等（整型枚举）
@@ -313,9 +319,18 @@ class Px4IsaacSimVelEnv(Node):
 
         self._set_position_target(x_enu, y_enu, z_enu, yaw=yaw)
 
-        self.get_logger().info(
-            f"Hovering at ENU({x_enu:.2f}, {y_enu:.2f}, {z_enu:.2f})"
-        )
+        target_alt = z_enu
+        alt_tol = 0.05  # meters
+        while True:
+            current = self._current_position_enu()
+            if current is not None:
+                _, _, cur_z = current
+                if math.isfinite(cur_z) and abs(cur_z - target_alt) <= alt_tol:
+                    break
+            self.get_logger().info(
+                f"Hovering at ENU({x_enu:.2f}, {y_enu:.2f}, {z_enu:.2f})"
+            )
+            rclpy.spin_once(self, timeout_sec=0.05)
 
     def pos_cnt(self,
                 position_enu: tuple,
@@ -344,6 +359,33 @@ class Px4IsaacSimVelEnv(Node):
         self.get_logger().info(
             f"Position control target ENU({x_enu:.2f}, {y_enu:.2f}, {z_enu:.2f})"
         )
+
+    def forward(self, dist: float):
+        """
+        利用位置控制沿 ENU x 正方向前进一步。
+        """
+        step = float(dist)
+        if step == 0.0:
+            return
+        self.pos_cnt((step, 0.0, 0.0), relative=True)
+
+    def turn(self, rad: float):
+        """
+        原地转向（弧度），内部根据当前位置调用 pos_cnt 更新 yaw。
+        """
+        yaw_delta = float(rad)
+        if math.isfinite(self._heading_rad):
+            target_yaw = self._heading_rad + yaw_delta
+        else:
+            target_yaw = yaw_delta
+            self.get_logger().warn("Turn requested before heading is available; treating angle as absolute yaw.")
+
+        current_pose = self._current_position_enu()
+        if current_pose is None:
+            current_pose = (0.0, 0.0, float(self.hover_alt))
+            self.get_logger().warn("Turn requested before position is available; using hover altitude at origin.")
+
+        self.pos_cnt(current_pose, relative=False, yaw=target_yaw)
 
     def vel_cnt(self,
                 velocity_enu: tuple,
@@ -423,20 +465,25 @@ def main():
 
     try:
         # 起飞并在 1m 高度悬停
-        node.take_off(hover_alt_m=1.0)
+        hover_alt_m=1.0
+        node.take_off(hover_alt_m)
         node.hover()
 
-        # 等待 2 秒让飞机稳定在目标高度
-        settle_until = node.get_clock().now() + Duration(seconds=10.0)
-        while node.get_clock().now() < settle_until:
-            rclpy.spin_once(node, timeout_sec=0.0)
+        # settle_until = node.get_clock().now() + Duration(seconds=20.0)
+        # while node.get_clock().now() < settle_until:
+        #     rclpy.spin_once(node, timeout_sec=0.0)
+        while node.ned_z >= -hover_alt_m:
+            print("Up to setting height:{}")
 
         # 位置控制：向前（ENU x 正方向）移动 1 米
         node.get_logger().info("Moving forward 1 m using position control (pos_cnt).")
         node.pos_cnt((1.0, 0.0, 0.0), relative=True)
 
-        # 等待 2 秒让飞机到达目标点
-        forward_until = node.get_clock().now() + Duration(seconds=10.0)
+        node.get_logger().info("Moving forward with 1 m / s velocity control")
+        node.vel_cnt((1.0, 0, 0))
+
+        
+        forward_until = node.get_clock().now() + Duration(seconds=5.0)
         while node.get_clock().now() < forward_until:
             rclpy.spin_once(node, timeout_sec=0.0)
 
