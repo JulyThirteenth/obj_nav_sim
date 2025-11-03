@@ -141,6 +141,9 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_x = math.nan
         self.ned_y = math.nan
         self.ned_z = math.nan  # VehicleLocalPosition.z（向下为正）
+        self._ned_vx = math.nan
+        self._ned_vy = math.nan
+        self._ned_vz = math.nan
         self._heading_rad = math.nan
 
         # “最近一次 setpoint”，用于定时器保活重复发布
@@ -156,12 +159,20 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_x = float(msg.x)
         self.ned_y = float(msg.y)
         self.ned_z = float(msg.z)  # NED：向下为正
+        self._ned_vx = float(getattr(msg, "vx", math.nan))
+        self._ned_vy = float(getattr(msg, "vy", math.nan))
+        self._ned_vz = float(getattr(msg, "vz", math.nan))
         heading = getattr(msg, "heading", math.nan)
         if heading is not None:
             heading = float(heading)
             if math.isfinite(heading):
                 self._heading_rad = heading
-        print(f"Local Position NED: x={self.ned_x:.2f}, y={self.ned_y:.2f}, z={self.ned_z:.2f}, heading={heading}")
+        print(
+            "Local Position NED: "
+            f"x={self.ned_x:.2f}, y={self.ned_y:.2f}, z={self.ned_z:.2f}, "
+            f"vx={self._ned_vx:.2f}, vy={self._ned_vy:.2f}, vz={self._ned_vz:.2f}, "
+            f"heading={heading}"
+        )
 
     def _on_status(self, msg: VehicleStatus):
         # arming_state: VehicleStatus.ARMING_STATE_ARMED 等（整型枚举）
@@ -284,6 +295,11 @@ class Px4IsaacSimVelEnv(Node):
             return float(self.ned_y), float(self.ned_x), float(-self.ned_z)
         return None
 
+    def _current_speed(self) -> float:
+        if math.isfinite(self._ned_vx) and math.isfinite(self._ned_vy) and math.isfinite(self._ned_vz):
+            return math.sqrt(self._ned_vx ** 2 + self._ned_vy ** 2 + self._ned_vz ** 2)
+        return float("nan")
+
     def _set_position_target(self, x_enu: float, y_enu: float, z_enu: float, yaw: float = math.nan):
         x_ned, y_ned, z_ned = enu_pos_to_ned(x_enu, y_enu, z_enu)
 
@@ -362,17 +378,45 @@ class Px4IsaacSimVelEnv(Node):
 
     def forward(self, dist: float):
         """
-        利用位置控制沿 ENU x 正方向前进一步。
+        利用当前位置和 yaw 方向进行前进控制。
         """
         step = float(dist)
         if step == 0.0:
             return
-        self.pos_cnt((step, 0.0, 0.0), relative=True)
+        heading = self._heading_rad
+
+        if math.isfinite(heading):
+            # 将机体系前向位移按照 yaw 转换到 ENU 坐标
+            delta_x = step * math.sin(heading)  # ENU x (East) 对应 NED y
+            delta_y = step * math.cos(heading)  # ENU y (North) 对应 NED x
+        else:
+            delta_x = 0.0
+            delta_y = 0.0
+            self.get_logger().warn(
+                "Forward requested before heading is available"
+            )
+
+        self.pos_cnt((delta_x, delta_y, 0.0), relative=True)
 
     def turn(self, rad: float):
         """
         原地转向（弧度），内部根据当前位置调用 pos_cnt 更新 yaw。
         """
+        # 先将速度模式指令清零，结合当前位置速度反馈等待完全停止
+        self.vel_cnt((0.0, 0.0, 0.0))
+        vel_tol = 0.05  # m/s
+        settle_deadline = self.get_clock().now() + Duration(seconds=1.0)
+        settled = False
+        while self.get_clock().now() < settle_deadline or settled:
+            rclpy.spin_once(self, timeout_sec=0.05)
+            current_speed = self._current_speed()
+            if math.isfinite(current_speed) and current_speed <= vel_tol:
+                settled = True
+                break
+
+        if not settled:
+            self.get_logger().warn("Turn requested before vehicle fully stopped; proceeding after timeout.")
+
         yaw_delta = float(rad)
         if math.isfinite(self._heading_rad):
             target_yaw = self._heading_rad + yaw_delta
