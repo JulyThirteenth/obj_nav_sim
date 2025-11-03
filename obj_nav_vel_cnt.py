@@ -82,7 +82,7 @@ class Px4IsaacSimVelEnv(Node):
         （可选）/rgb, /depth （RosImage）
 
     - API:
-        take_off(): 切入 Offboard 并解锁
+        take_off(alt): 切入 Offboard 并可更新目标高度
         hover(position): 固定位置悬停
         vel_cnt(velocity): 速度模式控制
         step(velocity_enu, yaw_rate_deg=0.0): 以 ENU 速度指令控制
@@ -142,7 +142,7 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_y = math.nan
         self.ned_z = math.nan  # VehicleLocalPosition.z（向下为正）
 
-        # “最近一次速度 setpoint”，用于定时器保活重复发布
+        # “最近一次 setpoint”，用于定时器保活重复发布
         self._last_sp: Optional[TrajectorySetpoint] = None
         self._use_velocity_mode = False  # 起飞阶段先用 position 模式
 
@@ -155,6 +155,7 @@ class Px4IsaacSimVelEnv(Node):
         self.ned_x = float(msg.x)
         self.ned_y = float(msg.y)
         self.ned_z = float(msg.z)  # NED：向下为正
+        print(f"Local Position NED: x={self.ned_x:.2f}, y={self.ned_y:.2f}, z={self.ned_z:.2f}")
 
     def _on_status(self, msg: VehicleStatus):
         # arming_state: VehicleStatus.ARMING_STATE_ARMED 等（整型枚举）
@@ -257,10 +258,13 @@ class Px4IsaacSimVelEnv(Node):
         self._send_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, param1=1.0, param2=0.0)
         
         
-    def take_off(self):
+    def take_off(self, hover_alt_m: Optional[float] = None):
         """
-        进入 Offboard 并解锁。
+        进入 Offboard 并解锁，可选更新目标悬停高度。
         """
+        if hover_alt_m is not None:
+            self.hover_alt = float(hover_alt_m)
+
         self._use_velocity_mode = False  # 起飞阶段用 position
         self._last_sp = None
         while not self.armed or self.nav_state != VehicleStatus.NAVIGATION_STATE_OFFBOARD:
@@ -269,25 +273,12 @@ class Px4IsaacSimVelEnv(Node):
 
         self.get_logger().info("Offboard + arm complete.")
 
-    def hover(self,
-              position_enu: Optional[tuple] = None,
-              yaw: float = math.nan):
-        """
-        切换到位置模式，在给定 ENU 位置（x,y,z）悬停；若未指定则保持当前位置的水平位置并调整到 hover_alt 高度。
-        """
-        if position_enu is None:
-            if math.isfinite(self.ned_x) and math.isfinite(self.ned_y):
-                # NED -> ENU
-                x_enu = float(self.ned_y)
-                y_enu = float(self.ned_x)
-            else:
-                x_enu = y_enu = 0.0
-            z_enu = float(self.hover_alt)
-        else:
-            if len(position_enu) != 3:
-                raise ValueError("position_enu 应为 (x, y, z) 三元组（ENU 坐标系）。")
-            x_enu, y_enu, z_enu = map(float, position_enu)
+    def _current_position_enu(self) -> Optional[tuple]:
+        if math.isfinite(self.ned_x) and math.isfinite(self.ned_y) and math.isfinite(self.ned_z):
+            return float(self.ned_y), float(self.ned_x), float(-self.ned_z)
+        return None
 
+    def _set_position_target(self, x_enu: float, y_enu: float, z_enu: float, yaw: float = math.nan):
         x_ned, y_ned, z_ned = enu_pos_to_ned(x_enu, y_enu, z_enu)
 
         self._use_velocity_mode = False
@@ -302,19 +293,57 @@ class Px4IsaacSimVelEnv(Node):
         sp.yawspeed = 0.0
         self._last_sp = sp
 
+    def hover(self,
+              position_enu: Optional[tuple] = None,
+              yaw: float = math.nan):
+        """
+        切换到位置模式，在给定 ENU 位置（x,y,z）悬停；若未指定则保持当前位置的水平位置并调整到 hover_alt 高度。
+        """
+        if position_enu is None:
+            current = self._current_position_enu()
+            if current is not None:
+                x_enu, y_enu, _ = current
+            else:
+                x_enu = y_enu = 0.0
+            z_enu = float(self.hover_alt)
+        else:
+            if len(position_enu) != 3:
+                raise ValueError("position_enu 应为 (x, y, z) 三元组（ENU 坐标系）。")
+            x_enu, y_enu, z_enu = map(float, position_enu)
+
+        self._set_position_target(x_enu, y_enu, z_enu, yaw=yaw)
+
         self.get_logger().info(
             f"Hovering at ENU({x_enu:.2f}, {y_enu:.2f}, {z_enu:.2f})"
         )
 
-    def reset_and_hover(self):
+    def pos_cnt(self,
+                position_enu: tuple,
+                relative: bool = False,
+                yaw: float = math.nan):
         """
-        兼容旧接口：先 take_off，再 hover 后切入速度模式悬停。
+        切换到位置模式，通过 ENU 位置指令控制。
+        relative=True 时表示 position_enu 为相对位移（ENU），将基于当前位置计算目标点。
         """
-        self.take_off()
-        self.hover(position_enu=None)
-        self.get_logger().info(f"Hover ready at ~{self.hover_alt:.2f} m (awaiting velocity commands).")
-        # 切换至速度模式零速度保持
-        self.vel_cnt((0.0, 0.0, 0.0))
+        if len(position_enu) != 3:
+            raise ValueError("position_enu 应为 (x, y, z) 三元组（ENU 坐标系）。")
+
+        x_enu, y_enu, z_enu = map(float, position_enu)
+        if relative:
+            current = self._current_position_enu()
+            if current is not None:
+                cur_x, cur_y, cur_z = current
+                x_enu += cur_x
+                y_enu += cur_y
+                z_enu += cur_z
+            else:
+                self.get_logger().warn("Relative position requested but current pose unknown; using absolute target.")
+
+        self._set_position_target(x_enu, y_enu, z_enu, yaw=yaw)
+
+        self.get_logger().info(
+            f"Position control target ENU({x_enu:.2f}, {y_enu:.2f}, {z_enu:.2f})"
+        )
 
     def vel_cnt(self,
                 velocity_enu: tuple,
@@ -340,6 +369,16 @@ class Px4IsaacSimVelEnv(Node):
         sp.yaw = math.nan
         sp.yawspeed = yaw_rate
         self._last_sp = sp
+
+    def reset_and_hover(self, hover_alt_m: Optional[float] = None):
+        """
+        兼容旧接口：先 take_off，再 hover 后切入速度模式悬停。
+        """
+        self.take_off(hover_alt_m=hover_alt_m)
+        self.hover(position_enu=None)
+        self.get_logger().info(f"Hover ready at ~{self.hover_alt:.2f} m (awaiting velocity commands).")
+        # 切换至速度模式零速度保持
+        self.vel_cnt((0.0, 0.0, 0.0))
 
     # ============================ High-level Env API ============================
 
@@ -384,23 +423,27 @@ def main():
 
     try:
         # 起飞并在 1m 高度悬停
-        node.take_off()
+        node.take_off(hover_alt_m=1.0)
         node.hover()
 
-        # # 示例：每 1s 向前飞一下、再原地，循环 5 次
-        # for i in range(5):
-        #     node.get_logger().info(f"[DEMO] Forward pulse {i+1}/5")
-        #     node.step((0.3, 0.0, 0.0))
-        #     t_end = node.get_clock().now() + Duration(seconds=1.0)
-        #     while node.get_clock().now() < t_end:
-        #         rclpy.spin_once(node, timeout_sec=0.0)
+        # 等待 2 秒让飞机稳定在目标高度
+        settle_until = node.get_clock().now() + Duration(seconds=10.0)
+        while node.get_clock().now() < settle_until:
+            rclpy.spin_once(node, timeout_sec=0.0)
 
-        #     node.step((0.0, 0.0, 0.0))  # 停止：清零速度指令
-        #     t_end = node.get_clock().now() + Duration(seconds=1.0)
-        #     while node.get_clock().now() < t_end:
-        #         rclpy.spin_once(node, timeout_sec=0.0)
+        # 位置控制：向前（ENU x 正方向）移动 1 米
+        node.get_logger().info("Moving forward 1 m using position control (pos_cnt).")
+        node.pos_cnt((1.0, 0.0, 0.0), relative=True)
 
-        # node.get_logger().info("Demo finished. Node keeps Offboard hover until process exit.")
+        # 等待 2 秒让飞机到达目标点
+        forward_until = node.get_clock().now() + Duration(seconds=10.0)
+        while node.get_clock().now() < forward_until:
+            rclpy.spin_once(node, timeout_sec=0.0)
+
+        # 在新位置上悬停
+        node.hover()
+        node.get_logger().info("Position control demo completed; holding hover.")
+
         rclpy.spin(node)
 
     except KeyboardInterrupt:
